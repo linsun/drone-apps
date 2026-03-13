@@ -1,0 +1,91 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: tello-backend
+  labels:
+    app: tello-backend
+spec:
+  replicas: 1  # Only 1 replica since we need direct connection to the drone
+  selector:
+    matchLabels:
+      app: tello-backend
+  template:
+    metadata:
+      labels:
+        app: tello-backend
+    spec:
+      containers:
+      - name: tello-backend
+        image: linsun/tello-backend:latest
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 3001
+          name: http
+          protocol: TCP
+        - containerPort: 3002
+          name: mcp
+          protocol: TCP
+        env:
+        - name: TELLO_PROXY_URL
+          value: "http://host.docker.internal:50000"
+        - name: USE_TELLO_PROXY
+          value: "true"
+        - name: HTTP_PORT
+          value: "3001"
+        - name: MCP_PORT
+          value: "3002"
+        - name: GITHUB_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: github-mcp-secret
+              key: GITHUB_PERSONAL_ACCESS_TOKEN
+        - name: GITHUB_MCP_SERVER_URL
+          value: "http://agentgateway.mcp.svc.cluster.local:3000/mcp"
+        - name: OLLAMA_URL
+          value: "http://host.docker.internal:11434"
+        # Optional: event name for PR branch/folder/title (e.g. "field-day-2025"). If unset, timestamp is used.
+        - name: GITHUB_PR_EVENT_NAME
+          value: ""
+        resources:
+          requests:
+            memory: "128Mi"
+            cpu: "100m"
+          limits:
+            memory: "256Mi"
+            cpu: "250m"
+        livenessProbe:
+          httpGet:
+            path: /api/status
+            port: 3001
+          initialDelaySeconds: 15
+          periodSeconds: 20
+          timeoutSeconds: 5
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /api/status
+            port: 3001
+          initialDelaySeconds: 5
+          periodSeconds: 10
+          timeoutSeconds: 5
+---
+# Service for accessing the backend from within the cluster and externally
+apiVersion: v1
+kind: Service
+metadata:
+  name: tello-backend
+  labels:
+    app: tello-backend
+spec:
+  type: NodePort
+  ports:
+  - port: 3001
+    targetPort: 3001
+    protocol: TCP
+    name: http
+  - port: 3002
+    targetPort: 3002
+    protocol: TCP
+    name: mcp
+  selector:
+    app: tello-backend

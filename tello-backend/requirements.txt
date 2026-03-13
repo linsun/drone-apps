@@ -1,0 +1,6 @@
+# Backend dependencies (runs in K8s, calls proxy)
+flask==3.0.0
+flask-cors==4.0.0
+requests==2.31.0
+mcp>=1.0.0
+uvicorn>=0.30.0
