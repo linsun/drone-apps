@@ -1,6 +1,6 @@
 """
-GitHub PR creation for Tello frontend: submit photo1, photo2, and LLaVA/Qwen3-VL
-analysis to a repo as a new branch and open a PR.
+GitHub PR creation: submit photo1, photo2, and AI engagement analysis
+to a repo as a new branch and open a PR.
 
 Uses GitHub MCP server for branch + markdown (create_branch, create_or_update_file).
 Uses GitHub REST API with GITHUB_TOKEN for binary images and for creating the PR
@@ -176,7 +176,7 @@ def _create_pull_request_api(owner, repo, head_branch, base_branch, title, body)
     return data.get("html_url"), data.get("number")
 
 
-def create_pr_payload(repo_slug, photo1_base64, photo2_base64, comparison_llava, comparison_qwen):
+def create_pr_payload(repo_slug, photo1_base64, photo2_base64, comparison_text):
     """
     Create a new branch, add photo1.jpg, photo2.jpg, analysis.md, and open a PR.
 
@@ -191,19 +191,18 @@ def create_pr_payload(repo_slug, photo1_base64, photo2_base64, comparison_llava,
         return {"success": False, "prUrl": None, "error": str(e)}
 
     try:
-        return _create_pr_impl(owner, repo, photo1_base64, photo2_base64, comparison_llava, comparison_qwen)
+        return _create_pr_impl(owner, repo, photo1_base64, photo2_base64, comparison_text)
     except Exception as e:
         logger.exception("create_pr_payload failed")
         return {"success": False, "prUrl": None, "error": str(e)}
 
 
-def _create_pr_impl(owner, repo, photo1_base64, photo2_base64, comparison_llava, comparison_qwen):
+def _create_pr_impl(owner, repo, photo1_base64, photo2_base64, comparison_text):
     import base64
     import re
 
     timestamp = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
     if GITHUB_PR_EVENT_NAME:
-        # Sanitize for branch/folder: alphanumeric, hyphens, underscores only
         event_slug = re.sub(r"[^a-zA-Z0-9_-]+", "-", GITHUB_PR_EVENT_NAME).strip("-") or timestamp
     else:
         event_slug = timestamp
@@ -211,7 +210,6 @@ def _create_pr_impl(owner, repo, photo1_base64, photo2_base64, comparison_llava,
     folder = f"captures/{event_slug}"
     base_branch = "main"
 
-    # Get base SHA (needed for API branch create / fallback)
     base_sha = _get_main_sha(owner, repo)
 
     # 1) Create branch: MCP first, else API
@@ -231,20 +229,16 @@ def _create_pr_impl(owner, repo, photo1_base64, photo2_base64, comparison_llava,
         _create_branch_api(owner, repo, branch_name, base_sha)
         logger.info("Branch created via API: %s", branch_name)
 
-    # 2) Analysis markdown: photos side by side at top, then LLaVA and Qwen sections
-    analysis_content = f"""# Drone/Webcam capture analysis – {event_slug}
+    # 2) Analysis markdown: photos side by side at top, then AI analysis section
+    analysis_content = f"""# Photo engagement analysis – {event_slug}
 
 | Photo 1 | Photo 2 |
 |---------|---------|
 | ![Photo 1](photo1.jpg) | ![Photo 2](photo2.jpg) |
 
-## LLaVA
+## AI Analysis (qwen3-vl)
 
-{comparison_llava or "(no response)"}
-
-## Qwen3-VL
-
-{comparison_qwen or "(no response)"}
+{comparison_text or "(no response)"}
 
 """
     analysis_b64 = base64.b64encode(analysis_content.encode("utf-8")).decode("ascii")
@@ -278,8 +272,8 @@ def _create_pr_impl(owner, repo, photo1_base64, photo2_base64, comparison_llava,
         logger.info("Uploaded %s via API", path)
 
     # 4) Create PR via API
-    pr_title = f"Drone capture {event_slug}"
-    pr_body = f"Photos and LLaVA/Qwen3-VL analysis from Tello frontend.\n\n- `{folder}/photo1.jpg`\n- `{folder}/photo2.jpg`\n- `{folder}/analysis.md`"
+    pr_title = f"Photo engagement analysis {event_slug}"
+    pr_body = f"Photos and AI engagement analysis.\n\n- `{folder}/photo1.jpg`\n- `{folder}/photo2.jpg`\n- `{folder}/analysis.md`"
     pr_url, pr_number = _create_pull_request_api(owner, repo, branch_name, base_branch, pr_title, pr_body)
     logger.info("PR created: #%s %s", pr_number, pr_url)
 

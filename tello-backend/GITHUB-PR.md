@@ -1,11 +1,11 @@
 # GitHub PR endpoint (`POST /api/github-pr`)
 
-The frontend calls this after LLaVA and Qwen3-VL analysis to create a PR in a GitHub repo with photo1, photo2, and both model responses.
+The frontend calls this after AI analysis to create a PR in a GitHub repo with photo1, photo2, and the analysis result.
 
 ## Flow
 
 1. **Branch**: Create branch `drone-capture-{timestamp}` from `main` (via GitHub MCP if `GITHUB_MCP_SERVER_URL` is set, else GitHub API).
-2. **Markdown**: Add `captures/{timestamp}/analysis.md` with LLaVA and Qwen3-VL text (MCP or API).
+2. **Markdown**: Add `captures/{timestamp}/analysis.md` with AI analysis text (MCP or API).
 3. **Images**: Add `photo1.jpg` and `photo2.jpg` via **GitHub REST API only** (MCP doesn’t handle binary).
 4. **PR**: Create pull request via GitHub API.
 
@@ -39,7 +39,7 @@ kubectl create secret generic github-token --from-literal=token=ghp_xxxx
 
 ## Request/response
 
-- **Request**: `POST /api/github-pr`, JSON body: `repo`, `photo1Base64`, `photo2Base64`, `comparisonLlava`, `comparisonQwen`.
+- **Request**: `POST /api/github-pr`, JSON body: `repo`, `photo1Base64`, `photo2Base64`, `comparisonResult`.
 - **Success**: `200`, `{ "success": true, "prUrl": "https://github.com/owner/repo/pull/123" }`.
 - **Error**: `4xx/5xx`, `{ "success": false, "error": "message" }`.
 
