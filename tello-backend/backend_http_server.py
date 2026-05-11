@@ -373,18 +373,190 @@ def capture_photo():
         return jsonify({'success': False, 'error': str(e)}), 500
 
 
+def _resize_base64_image(b64_data, max_dim=512, quality=85):
+    """Downscale a base64-encoded JPEG/PNG so the longest side is at most *max_dim* pixels.
+
+    Returns a base64-encoded JPEG string (no data-URI prefix).  If the image is
+    already small enough, it is re-encoded at the target quality to keep payload
+    size down.
+    """
+    import base64
+    import io
+    from PIL import Image
+
+    raw = base64.b64decode(b64_data)
+    img = Image.open(io.BytesIO(raw))
+
+    if img.mode in ('RGBA', 'P'):
+        img = img.convert('RGB')
+
+    w, h = img.size
+    if max(w, h) > max_dim:
+        scale = max_dim / max(w, h)
+        img = img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
+
+    buf = io.BytesIO()
+    img.save(buf, format='JPEG', quality=quality)
+    return base64.b64encode(buf.getvalue()).decode('ascii')
+
+
+def _label_base64_image(b64_data, label):
+    """Burn a bold text label (e.g. 'PHOTO 1') into the top-left corner of the image.
+
+    This gives the VLM a visual anchor so it cannot confuse which image is which.
+    Returns a base64-encoded JPEG string.
+    """
+    import base64
+    import io
+    from PIL import Image, ImageDraw, ImageFont
+
+    raw = base64.b64decode(b64_data)
+    img = Image.open(io.BytesIO(raw))
+    if img.mode in ('RGBA', 'P'):
+        img = img.convert('RGB')
+
+    draw = ImageDraw.Draw(img)
+    w, _ = img.size
+    font_size = max(20, w // 12)
+    try:
+        font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", font_size)
+    except (OSError, IOError):
+        try:
+            font = ImageFont.truetype("Arial Bold.ttf", font_size)
+        except (OSError, IOError):
+            font = ImageFont.load_default()
+
+    bbox = draw.textbbox((0, 0), label, font=font)
+    text_w, text_h = bbox[2] - bbox[0], bbox[3] - bbox[1]
+    pad = 8
+    draw.rectangle([0, 0, text_w + pad * 2, text_h + pad * 2], fill=(0, 0, 0))
+    draw.text((pad, pad), label, fill=(255, 255, 255), font=font)
+
+    buf = io.BytesIO()
+    img.save(buf, format='JPEG', quality=90)
+    return base64.b64encode(buf.getvalue()).decode('ascii')
+
+
+_VISION_MODEL = os.getenv('VISION_MODEL', 'qwen3-vl:4b')
+
+_COMPARE_PROMPT = (
+    'I am sending you two photos. The first image is Photo 1 and the second image is Photo 2. '
+    'Compare them for audience engagement. '
+    'You MUST respond with EXACTLY this format:\n'
+    'Photo 1 score: <number from 1 to 10>\n'
+    'Photo 1 expression: <one sentence about facial expression and emotion>\n'
+    'Photo 1 energy: <one sentence about how dynamic or attention-grabbing it feels>\n'
+    'Photo 2 score: <number from 1 to 10>\n'
+    'Photo 2 expression: <one sentence about facial expression and emotion>\n'
+    'Photo 2 energy: <one sentence about how dynamic or attention-grabbing it feels>'
+)
+
+
+def _call_vision_model(req_lib, ollama_url, messages):
+    """Make a single Ollama chat call and return (text, error_msg)."""
+    resp = req_lib.post(
+        f'{ollama_url}/api/chat',
+        json={
+            'model': _VISION_MODEL,
+            'messages': messages,
+            'stream': False,
+            'keep_alive': '30m',
+            'options': {
+                'temperature': 0,
+            },
+        },
+        timeout=300,
+    )
+    if resp.ok:
+        import re as _re
+        body = resp.json()
+        text = (body.get('message', {}).get('content')
+                or body.get('response')
+                or body.get('content', ''))
+        text = _re.sub(r'<think>.*?</think>\s*', '', text, flags=_re.DOTALL)
+        return text.strip(), None
+    err = resp.json() if resp.headers.get('content-type', '').startswith('application/json') else {}
+    msg = f'Error {resp.status_code}: {err.get("error", resp.reason)}'
+    if resp.status_code == 404:
+        msg += f'. Model "{_VISION_MODEL}" may not be installed. Run: ollama pull {_VISION_MODEL}'
+    return None, msg
+
+
+def _parse_comparison(text):
+    """Parse the structured comparison response from the vision model."""
+    import re
+    result = {}
+
+    match = re.search(r'Photo 1 score:\s*(\d+(?:\.\d+)?)', text)
+    if match:
+        result['score1'] = float(match.group(1))
+    match = re.search(r'Photo 2 score:\s*(\d+(?:\.\d+)?)', text)
+    if match:
+        result['score2'] = float(match.group(1))
+
+    for key in ('expression', 'energy'):
+        match = re.search(rf'Photo 1 {key}:\s*(.+)', text, re.IGNORECASE)
+        if match:
+            result[f'photo1_{key}'] = match.group(1).strip()
+        match = re.search(rf'Photo 2 {key}:\s*(.+)', text, re.IGNORECASE)
+        if match:
+            result[f'photo2_{key}'] = match.group(1).strip()
+
+    return result
+
+
+def _build_display_text(parsed):
+    """Build the user-facing analysis text from parsed comparison data."""
+    lines = []
+    score1 = parsed.get('score1')
+    score2 = parsed.get('score2')
+
+    if score1 is not None:
+        lines.append(f'Photo 1 score: {score1}/10')
+    for key in ('expression', 'energy'):
+        val = parsed.get(f'photo1_{key}')
+        if val:
+            lines.append(f'Photo 1 {key}: {val}')
+
+    lines.append('')
+
+    if score2 is not None:
+        lines.append(f'Photo 2 score: {score2}/10')
+    for key in ('expression', 'energy'):
+        val = parsed.get(f'photo2_{key}')
+        if val:
+            lines.append(f'Photo 2 {key}: {val}')
+
+    return '\n'.join(lines)
+
+
+def _extract_summary(text):
+    import re
+    match = re.search(r'[Ss]ummary:\s*(.+)', text, re.DOTALL)
+    if match:
+        return match.group(1).strip()
+    sentences = [s.strip() for s in re.split(r'[.!?]+', text) if s.strip()]
+    if sentences:
+        return sentences[-1]
+    return text.strip()
+
+
 @app.route('/api/compare-photos', methods=['POST'])
 def compare_photos():
     """
-    Run LLaVA and Qwen3-VL analysis on two photos in parallel via Ollama.
+    Compare two photos in a single vision model call.
+
+    Uses chunked transfer encoding with periodic keepalive newlines to prevent
+    ztunnel / Nginx / intermediate proxies from closing idle connections.
 
     Expects JSON: { "photo1Base64": "...", "photo2Base64": "..." }
-    Returns JSON:  { "success": true, "llava": { "text": "...", "summary": "..." },
-                     "qwen": { "text": "...", "summary": "..." } }
+    Returns JSON:  { "success": true, "text": "...", "summary": "..." }
     """
-    import re
-    import requests
-    from concurrent.futures import ThreadPoolExecutor, as_completed
+    import json as _json
+    import threading
+    import time
+    import requests as req_lib
+    from flask import Response, stream_with_context
 
     ollama_url = os.getenv('OLLAMA_URL', 'http://localhost:11434')
 
@@ -395,100 +567,68 @@ def compare_photos():
     if not photo1_b64 or not photo2_b64:
         return jsonify({'success': False, 'error': 'Missing photo1Base64 or photo2Base64'}), 400
 
-    compare_prompt = (
-        'Now compare Photo 1 and Photo 2 for audience engagement. '
-        'Analyze key differences in facial expression, gesture, composition, lighting, positioning. '
-        'Which photo is more engaging? Respond in less than 50 words, then provide a 10-word summary '
-        'at the end in a new paragraph.'
-    )
+    result_holder = {}
+    done = threading.Event()
 
-    def _build_messages(model_name):
-        """Build model-specific message lists.
+    print(f"[compare] Starting analysis, photo1 size={len(photo1_b64)}, photo2 size={len(photo2_b64)}", flush=True)
 
-        LLaVA doesn't reliably distinguish image ordering when both images are
-        in a single message, so we use multi-turn messages to label each image
-        explicitly.  Qwen3-VL handles multi-image ordering correctly with both
-        images in one message."""
-        if model_name == 'llava':
-            return [
-                {'role': 'user', 'content': 'This is Photo 1.', 'images': [photo1_b64]},
-                {'role': 'assistant', 'content': 'Got it, I see Photo 1.'},
-                {'role': 'user', 'content': 'This is Photo 2.', 'images': [photo2_b64]},
-                {'role': 'assistant', 'content': 'Got it, I see Photo 2.'},
-                {'role': 'user', 'content': compare_prompt},
-            ]
-        else:
-            return [
-                {
-                    'role': 'user',
-                    'content': (
-                        'I am providing two images. The first image is Photo 1 and '
-                        'the second image is Photo 2. ' + compare_prompt
-                    ),
-                    'images': [photo1_b64, photo2_b64],
-                },
-            ]
+    try:
+        messages = [
+            {
+                'role': 'user',
+                'content': _COMPARE_PROMPT,
+                'images': [photo1_b64, photo2_b64],
+            },
+        ]
 
-    def _extract_summary(text):
-        match = re.search(r'[Ss]ummary:\s*(.+?)(?:\.|$)', text)
-        if match:
-            words = match.group(1).strip().split()
-            return ' '.join(words[:10])
-        sentences = [s.strip() for s in re.split(r'[.!?]+', text) if s.strip()]
-        if sentences:
-            words = sentences[-1].split()
-            return ' '.join(words[:10])
-        words = text.split()
-        if len(words) >= 10:
-            start = (len(words) - 10) // 2
-            return ' '.join(words[start:start + 10])
-        return ' '.join(words[:10])
+        text, err = _call_vision_model(req_lib, ollama_url, messages)
+        print(f"[compare] Model returned, err={err}, text length={len(text) if text else 0}", flush=True)
 
-    def _call_model(model_name):
-        try:
-            resp = requests.post(
-                f'{ollama_url}/api/chat',
-                json={
-                    'model': model_name,
-                    'messages': _build_messages(model_name),
-                    'stream': False,
-                },
-                timeout=300,
-            )
-            if resp.ok:
-                body = resp.json()
-                text = body.get('message', {}).get('content') or body.get('response') or body.get('content', '')
-                return {'text': text, 'summary': _extract_summary(text)}
+        if err:
+            print(f"[compare] Model error: {err}", flush=True)
+            return jsonify({'success': False, 'text': err, 'summary': '', 'error': err}), 502
+
+        print(f"[compare] Raw model output: {text[:500]}", flush=True)
+
+        parsed = _parse_comparison(text)
+        print(f"[compare] Parsed: {parsed}", flush=True)
+
+        score1 = parsed.get('score1')
+        score2 = parsed.get('score2')
+        display = _build_display_text(parsed)
+
+        if score1 is not None and score2 is not None:
+            diff = abs(score1 - score2)
+            if diff < 0.5:
+                summary = 'The two photos are nearly equal in engagement with no clear winner.'
             else:
-                err = resp.json() if resp.headers.get('content-type', '').startswith('application/json') else {}
-                msg = f'Error {resp.status_code}: {err.get("error", resp.reason)}'
-                if resp.status_code == 404:
-                    msg += f'. Model "{model_name}" may not be installed. Run: ollama pull {model_name}'
-                return {'text': msg, 'summary': '', 'error': True}
-        except Exception as e:
-            return {'text': f'{model_name} error: {e}', 'summary': '', 'error': True}
+                w = 1 if score1 > score2 else 2
+                reason = parsed.get(f'photo{w}_expression', '') or parsed.get(f'photo{w}_energy', '')
+                reason = reason.rstrip('.').lower()
+                summary = f'Photo {w} is more engaging because {reason}.' if reason else f'Photo {w} is more engaging overall.'
+            final_text = f'{display}\n\nSummary: {summary}'
+        else:
+            final_text = display or text
 
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        futures = {
-            pool.submit(_call_model, 'llava'): 'llava',
-            pool.submit(_call_model, 'qwen3-vl'): 'qwen',
-        }
-        results = {}
-        for future in as_completed(futures):
-            key = futures[future]
-            results[key] = future.result()
+        result_summary = _extract_summary(final_text)
+        print(f"[compare] Final text length={len(final_text)}, summary={result_summary}", flush=True)
 
-    return jsonify({
-        'success': True,
-        'llava': results.get('llava', {'text': '', 'summary': ''}),
-        'qwen': results.get('qwen', {'text': '', 'summary': ''}),
-    })
+        return jsonify({
+            'success': True,
+            'text': final_text,
+            'summary': result_summary,
+        })
+    except Exception as e:
+        print(f"[compare] Exception: {e}", flush=True)
+        import traceback
+        traceback.print_exc()
+        return jsonify({'success': False, 'text': f'Vision model error: {e}', 'summary': '', 'error': str(e)}), 500
 
 
 @app.route('/api/github-pr', methods=['POST'])
 def github_pr():
     """
-    Create a PR in a GitHub repo with photo1, photo2, and LLaVA/Qwen3-VL analysis.
+    Create a PR in a GitHub repo with photo1, photo2, and AI analysis.
     Uses GitHub MCP for branch + markdown; GitHub API for images and PR.
     """
     try:
@@ -500,8 +640,7 @@ def github_pr():
     repo = data.get('repo', '').strip()
     photo1_base64 = data.get('photo1Base64', '')
     photo2_base64 = data.get('photo2Base64', '')
-    comparison_llava = data.get('comparisonLlava', '')
-    comparison_qwen = data.get('comparisonQwen', '')
+    comparison_result = data.get('comparisonResult', '') or data.get('comparisonLlava', '')
 
     if not repo:
         return jsonify({'success': False, 'error': 'Missing repo'}), 400
@@ -512,8 +651,7 @@ def github_pr():
         repo_slug=repo,
         photo1_base64=photo1_base64,
         photo2_base64=photo2_base64,
-        comparison_llava=comparison_llava,
-        comparison_qwen=comparison_qwen,
+        comparison_text=comparison_result,
     )
 
     if result['success']:
@@ -549,8 +687,8 @@ if __name__ == '__main__':
     print("  POST /api/stop-stream        ← Stop video")
     print("  GET  /api/video-feed         ← Video stream (MJPEG)")
     print("  POST /api/capture            ← Take photo")
-    print("  POST /api/compare-photos     ← AI comparison (LLaVA + Qwen3-VL via Ollama)")
-    print("  POST /api/github-pr          ← Create PR (photos + LLaVA/Qwen analysis)")
+    print("  POST /api/compare-photos     ← AI comparison (LLaVA via Ollama)")
+    print("  POST /api/github-pr          ← Create PR (photos + LLaVA analysis)")
     print("=" * 60)
 
     app.run(host='0.0.0.0', port=http_port, debug=False)

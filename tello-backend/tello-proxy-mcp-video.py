@@ -43,8 +43,50 @@ from flask import Flask, jsonify, request, Response, send_file
 from flask_cors import CORS
 from mcp.server.fastmcp import FastMCP
 import cv2
+import av
+import numpy as np
 from djitellopy import Tello
+from djitellopy.tello import BackgroundFrameRead
 import uvicorn
+
+
+# Monkey-patch BackgroundFrameRead.update_frame to handle InvalidDataError.
+# The stock djitellopy only catches av.error.ExitError, so a single corrupt
+# H.264 packet (common over Tello's UDP stream) kills the decode thread.
+_original_update_frame = BackgroundFrameRead.update_frame
+
+def _resilient_update_frame(self):
+    try:
+        for frame in self.container.decode(video=0):
+            try:
+                if self.with_queue:
+                    self.frames.append(np.array(frame.to_image()))
+                else:
+                    self.frame = np.array(frame.to_image())
+            except Exception:
+                pass
+
+            if self.stopped:
+                self.container.close()
+                break
+    except av.error.InvalidDataError:
+        print("⚠️  InvalidDataError in decode stream – reopening container…")
+        try:
+            self.container.close()
+        except Exception:
+            pass
+        try:
+            self.container = av.open(self.address,
+                                     timeout=(Tello.FRAME_GRAB_TIMEOUT, None))
+            _resilient_update_frame(self)
+        except Exception as e:
+            print(f"❌ Failed to reopen video container: {e}")
+    except av.error.ExitError:
+        raise
+    except Exception as e:
+        print(f"⚠️  Unexpected error in update_frame: {e}")
+
+BackgroundFrameRead.update_frame = _resilient_update_frame
 
 # Tello configuration
 TELLO_IP = '192.168.10.1'
@@ -234,7 +276,7 @@ def start_video_stream() -> tuple[bool, str]:
         tello.set_video_fps(tello.FPS_30)
 
         tello.streamon()
-        time.sleep(2)
+        time.sleep(4)
 
         frame_read = tello.get_frame_read()
         time.sleep(1)
